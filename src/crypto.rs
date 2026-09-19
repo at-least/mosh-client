@@ -610,4 +610,49 @@ mod tests {
             assert_ne!(id, 0);
         }
     }
+
+    /// Boundary: the last usable sequence number must still seal, and
+    /// only the one past it is exhausted — this gate is the key-reuse
+    /// guard, so its `>` cannot tolerate an off-by-one.
+    #[test]
+    fn sequence_exhaustion_boundary_is_exact() {
+        let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+        let mut sealer = MoshSealer::new(&key, Direction::ToServer);
+        sealer.next_seq = SEQ_MASK; // the last usable sequence number
+        let header = PacketHeader {
+            timestamp: 0,
+            timestamp_reply: 0,
+        };
+        sealer
+            .seal(&header, b"boundary")
+            .expect("the last sequence before exhaustion must still seal");
+        assert_eq!(
+            sealer.seal(&header, b"boundary").unwrap_err(),
+            MoshCryptoError::SequenceExhausted,
+            "the sequence one past the last usable one must be exhausted"
+        );
+    }
+
+    /// Boundary: a datagram of exactly MIN_DATAGRAM_LEN gets past the
+    /// length gate (to the tag check), only a shorter one is rejected
+    /// as too short.
+    #[test]
+    fn min_datagram_len_boundary_is_exact() {
+        let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+        let opener = MoshOpener::new(&key, Direction::ToClient);
+        let short = vec![0u8; MIN_DATAGRAM_LEN - 1];
+        assert_eq!(
+            opener.open(&short).unwrap_err(),
+            MoshCryptoError::DatagramTooShort
+        );
+        // exact length, ToClient direction bit set, garbage payload:
+        // past the length gate, dead at the tag check
+        let mut exact = vec![0u8; MIN_DATAGRAM_LEN];
+        exact[0] = 0x80;
+        assert_eq!(
+            opener.open(&exact).unwrap_err(),
+            MoshCryptoError::TagMismatch,
+            "an exact-length datagram must reach the tag check"
+        );
+    }
 }
