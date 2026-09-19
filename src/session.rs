@@ -82,6 +82,13 @@ pub struct LinkHealth {
     pub since_ack_ms: u64,
     /// True until the first authenticated datagram ("still connecting").
     pub never_heard: bool,
+    /// The smoothed round-trip estimate, once a genuine timestamp reply
+    /// confirmed a sample. `None` = cold start: the RTO rides the
+    /// initial constants.
+    pub rtt_ms: Option<u64>,
+    /// The current retransmission timeout — the clamped
+    /// `srtt + 4·rttvar` (50ms floor, 1s ceiling).
+    pub rto_ms: u64,
 }
 
 /// The display the session's loop drives: the embedder's terminal
@@ -197,15 +204,23 @@ struct Shared {
     /// Whether host bytes also accumulate for [`MoshSession::take_host_bytes`]
     /// (on by default; display-only embedders turn it off).
     capture_host_bytes: AtomicBool,
+    /// The srtt estimate in ms, biased by +1 so 0 means "no sample yet"
+    /// (one atomic: a reader must never see known-but-unwritten).
+    rtt_ms_biased: AtomicU64,
+    /// The current retransmission timeout, stored per tick.
+    rto_ms: AtomicU64,
 }
 
 impl Shared {
     fn link_health(&self) -> LinkHealth {
         let now = self.now_ms.load(Ordering::Relaxed);
+        let rtt = self.rtt_ms_biased.load(Ordering::Relaxed);
         LinkHealth {
             since_heard_ms: now.saturating_sub(self.last_heard_ms.load(Ordering::Relaxed)),
             since_ack_ms: now.saturating_sub(self.last_roundtrip_ms.load(Ordering::Relaxed)),
             never_heard: self.never_heard.load(Ordering::Relaxed),
+            rtt_ms: if rtt == 0 { None } else { Some(rtt - 1) },
+            rto_ms: self.rto_ms.load(Ordering::Relaxed),
         }
     }
 }
@@ -339,6 +354,8 @@ impl<D: MoshDisplay> MoshSession<D> {
             ports_opened: AtomicU64::new(1),
             user_acked: AtomicU64::new(0),
             capture_host_bytes: AtomicBool::new(true),
+            rtt_ms_biased: AtomicU64::new(0),
+            rto_ms: AtomicU64::new(1000),
         });
         let pending = Arc::new(Mutex::new(Vec::new()));
         let prediction = Arc::new(Mutex::new(PredictionState {
@@ -787,9 +804,11 @@ impl<D: MoshDisplay> SessionLoop<D> {
             }
 
             let mut out = Vec::new();
+            let rto = self.rto();
+            self.shared.rto_ms.store(rto, Ordering::Relaxed);
             self.sender.tick(
                 now,
-                self.rto(),
+                rto,
                 self.send_interval(),
                 self.fragment_mtu(),
                 &mut self.fragmenter,
@@ -964,6 +983,9 @@ impl<D: MoshDisplay> SessionLoop<D> {
                         self.rttvar = 0.75 * self.rttvar + 0.25 * (self.srtt - r).abs();
                         self.srtt = 0.875 * self.srtt + 0.125 * r;
                     }
+                    self.shared
+                        .rtt_ms_biased
+                        .store(self.srtt.round() as u64 + 1, Ordering::Relaxed);
                 }
             }
         }

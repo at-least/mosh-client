@@ -5,7 +5,7 @@
 //! handshake.
 
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,15 @@ struct ServerHandles {
     /// every user resize the server has received (latest full stream)
     resizes: Arc<Mutex<Vec<(i32, i32)>>>,
     saw_shutdown: Arc<AtomicBool>,
+    /// Echo the client's timestamp back as timestamp_reply (feeds the
+    /// client's RTT estimator).
+    echo_timestamps: Arc<AtomicBool>,
+    /// Echo with a 30s offset: every implied sample exceeds the
+    /// client's RTT_MAX_SAMPLE gate and must be rejected.
+    echo_absurd: Arc<AtomicBool>,
+    /// Absurd echoes actually sent (0 would make the absurd test's
+    /// no-sample assertion vacuous).
+    absurd_echoes: Arc<AtomicU64>,
 }
 
 /// A capture display: records fed bytes + resizes at a fixed size.
@@ -114,6 +123,9 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
     let received = Arc::new(Mutex::new(Vec::new()));
     let resizes = Arc::new(Mutex::new(Vec::new()));
     let saw_shutdown = Arc::new(AtomicBool::new(false));
+    let echo_timestamps = Arc::new(AtomicBool::new(false));
+    let echo_absurd = Arc::new(AtomicBool::new(false));
+    let absurd_echoes = Arc::new(AtomicU64::new(0));
 
     let outbox_move = Arc::clone(&outbox);
     let silent_move = Arc::clone(&go_silent);
@@ -123,6 +135,9 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
     let received_move = Arc::clone(&received);
     let resizes_move = Arc::clone(&resizes);
     let shutdown_move = Arc::clone(&saw_shutdown);
+    let echo_move = Arc::clone(&echo_timestamps);
+    let absurd_move = Arc::clone(&echo_absurd);
+    let absurd_count = Arc::clone(&absurd_echoes);
     std::thread::spawn(move || {
         let mut sealer = MoshSealer::new(&key, Direction::ToClient);
         let opener = MoshOpener::new(&key, Direction::ToServer);
@@ -131,6 +146,11 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
         let mut fragmenter = Fragmenter::default();
         let mut assembly = FragmentAssembly::new();
         let mut peer: Option<std::net::SocketAddr> = None;
+        // the client timestamp to echo, and whether one has arrived
+        // since the last echo went out — re-echoing a stale timestamp
+        // forever would inflate every sample by the client's send gap
+        let mut peer_ts: u16 = 0;
+        let mut peer_ts_fresh = false;
         let origin = Instant::now();
         let now = || origin.elapsed().as_millis() as u64;
 
@@ -157,13 +177,41 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
                 let mut frags = Vec::new();
                 sender.tick(t, 120, 20, 1200 - 12 - 16, &mut fragmenter, &mut frags);
                 if let Some(peer_addr) = peer {
-                    for frag in &frags {
-                        let header = PacketHeader {
-                            timestamp: (t % 65_536) as u16,
-                            timestamp_reply: u16::MAX,
-                        };
-                        if let Ok(datagram) = sealer.seal(&header, &frag.tostring()) {
-                            let _ = socket.send_to(&datagram, peer_addr);
+                    // timestamp_reply per the test's script: nothing
+                    // (MAX), or the client's timestamp — but only one
+                    // reply per client datagram, never a re-echo of a
+                    // stale one (that would inflate every sample by
+                    // the client's send gap). The same computation
+                    // drives the immediate echo in the recv branch.
+                    let reply = if absurd_move.load(Ordering::Relaxed) {
+                        peer_ts.wrapping_sub(30_000)
+                    } else if echo_move.load(Ordering::Relaxed) {
+                        peer_ts
+                    } else {
+                        u16::MAX
+                    };
+                    let echo_wanted =
+                        echo_move.load(Ordering::Relaxed) || absurd_move.load(Ordering::Relaxed);
+                    if echo_wanted && peer_ts_fresh {
+                        peer_ts_fresh = false;
+                        for frag in &frags {
+                            let header = PacketHeader {
+                                timestamp: (t % 65_536) as u16,
+                                timestamp_reply: reply,
+                            };
+                            if let Ok(datagram) = sealer.seal(&header, &frag.tostring()) {
+                                let _ = socket.send_to(&datagram, peer_addr);
+                            }
+                        }
+                    } else {
+                        for frag in &frags {
+                            let header = PacketHeader {
+                                timestamp: (t % 65_536) as u16,
+                                timestamp_reply: u16::MAX,
+                            };
+                            if let Ok(datagram) = sealer.seal(&header, &frag.tostring()) {
+                                let _ = socket.send_to(&datagram, peer_addr);
+                            }
                         }
                     }
                 }
@@ -175,7 +223,28 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
                     if silent {
                         continue; // swallow traffic, never answer
                     }
-                    if let Ok((_, _header, fragment)) = opener.open(&buf[..len]) {
+                    if let Ok((_, header, fragment)) = opener.open(&buf[..len]) {
+                        peer_ts = header.timestamp;
+                        peer_ts_fresh = true;
+                        // a real server answers immediately; echoing at
+                        // receive time keeps the client's sample ≈ the
+                        // true wire RTT rather than one send gap
+                        if echo_move.load(Ordering::Relaxed) || absurd_move.load(Ordering::Relaxed)
+                        {
+                            let reply = if absurd_move.load(Ordering::Relaxed) {
+                                absurd_count.fetch_add(1, Ordering::Relaxed);
+                                peer_ts.wrapping_sub(30_000)
+                            } else {
+                                peer_ts
+                            };
+                            let reply_header = PacketHeader {
+                                timestamp: (t % 65_536) as u16,
+                                timestamp_reply: reply,
+                            };
+                            if let Ok(datagram) = sealer.seal(&reply_header, &[]) {
+                                let _ = socket.send_to(&datagram, src);
+                            }
+                        }
                         if let Ok(fragment) = Fragment::parse(&fragment) {
                             if let Some(inst) = assembly.add_fragment(fragment) {
                                 sender.process_acknowledgment_through(inst.ack_num);
@@ -265,6 +334,9 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
         received,
         resizes,
         saw_shutdown,
+        echo_timestamps,
+        echo_absurd,
+        absurd_echoes,
     }
 }
 
@@ -1153,6 +1225,144 @@ fn display_accessors_and_acked_introspection() {
         "with_display must read the display() the session hands out"
     );
     assert_eq!(client.display().lock().unwrap().cols(), 70);
+    server.stop.store(true, Ordering::Relaxed);
+    client.terminate();
+}
+
+// --- the RTT machinery ---------------------------------------------------
+
+/// With the server echoing the client's timestamps, the RTT estimate
+/// must converge on the (tiny) loopback delay and the retransmission
+/// timeout must fall from its 1s cold-start ceiling toward the 50ms
+/// floor. This is the adaptive path no earlier test exercised: the
+/// mirror server used to send timestamp_reply = u16::MAX forever, so
+/// every RTO in the suite silently rode the initial constants.
+#[test]
+fn rtt_estimate_converges_on_the_server_timestamp_echo() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+    let client = MoshSession::connect(
+        TestDisplay::new(80, 24),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        |_| {},
+        80,
+        24,
+        false,
+    )
+    .expect("connect");
+    assert!(
+        wait_until(3000, || !client.link_health().never_heard),
+        "associate first"
+    );
+
+    // cold start: the echo is off, so no sample can exist and the
+    // srtt/rttvar constants put the RTO at its 1s ceiling
+    assert_eq!(
+        client.link_health().rtt_ms,
+        None,
+        "no RTT sample while the server echoes nothing"
+    );
+    assert_eq!(
+        client.link_health().rto_ms,
+        1000,
+        "cold-start RTO is the 1s ceiling"
+    );
+
+    server.echo_timestamps.store(true, Ordering::Relaxed);
+    // samples only exist where datagrams flow, and an idle client sits
+    // in rto backoff — it can stay silent for seconds. A typing user is
+    // the real traffic source: keep typing INSIDE the wait so a slow
+    // runner keeps making progress instead of just expiring. Each burst
+    // is echoed at once, so the sample tracks the wire and the RTO must
+    // end far below its 1s cold start (on an idle host it pins the
+    // 50ms clamp floor exactly).
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && client.link_health().rto_ms > 150 {
+        client.send_input(b"x");
+        std::thread::sleep(Duration::from_millis(12));
+    }
+    // a few more bursts unconditionally: the loop above stops at the
+    // first accepted sample, and the running srtt/rttvar blend (every
+    // sample after the first) is its own code path
+    for _ in 0..10 {
+        client.send_input(b"x");
+        std::thread::sleep(Duration::from_millis(12));
+    }
+    assert!(
+        client.link_health().rto_ms <= 150,
+        "the RTO must track the echoed samples down from 1s, got {}",
+        client.link_health().rto_ms
+    );
+    let rtt = client.link_health().rtt_ms.expect("an accepted sample");
+    assert!(rtt <= 500, "loopback RTT must stay small, got {rtt}ms");
+    server.stop.store(true, Ordering::Relaxed);
+    client.terminate();
+}
+
+/// A timestamp reply implying an absurd sample (≥ RTT_MAX_SAMPLE) is
+/// rejected wholesale: garbage or a long-dead peer must not drag the
+/// RTO anywhere. The estimate stays cold while the nonsense replies
+/// keep coming.
+#[test]
+fn absurd_timestamp_reply_does_not_move_the_estimate() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+    let client = MoshSession::connect(
+        TestDisplay::new(80, 24),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        |_| {},
+        80,
+        24,
+        false,
+    )
+    .expect("connect");
+    assert!(
+        wait_until(3000, || !client.link_health().never_heard),
+        "associate first"
+    );
+    assert_eq!(client.link_health().rtt_ms, None);
+    assert_eq!(client.link_health().rto_ms, 1000);
+
+    // "echo" with a 30s offset: every implied sample exceeds the 5s
+    // RTT_MAX_SAMPLE gate and must be dropped. The typing bursts keep
+    // datagrams flowing so the nonsense replies actually reach the
+    // estimator; the echo count and the link freshness prove the
+    // replies really flew — without them the no-sample assertion would
+    // be vacuous.
+    server.echo_absurd.store(true, Ordering::Relaxed);
+    // cold-start send_interval is 250ms — the bursts coalesce into one
+    // datagram per interval — so echoes accrue at ~4/s. Ask for five
+    // (≈1.5s of typing) and cap the wait at 6s.
+    let mut absurd_rounds = 0;
+    while server.absurd_echoes.load(Ordering::Relaxed) < 5 && absurd_rounds < 400 {
+        client.send_input(b"y");
+        absurd_rounds += 1;
+        std::thread::sleep(Duration::from_millis(15));
+    }
+    assert!(
+        server.absurd_echoes.load(Ordering::Relaxed) >= 5,
+        "the server must actually have sent absurd echoes, sent {}",
+        server.absurd_echoes.load(Ordering::Relaxed)
+    );
+    assert!(
+        client.link_health().since_heard_ms < 500,
+        "the client must still be receiving datagrams, last heard {}ms ago",
+        client.link_health().since_heard_ms
+    );
+    assert_eq!(
+        client.link_health().rtt_ms,
+        None,
+        "an absurd sample must never confirm the estimate"
+    );
+    assert_eq!(
+        client.link_health().rto_ms,
+        1000,
+        "the RTO must not move on rejected samples"
+    );
     server.stop.store(true, Ordering::Relaxed);
     client.terminate();
 }
