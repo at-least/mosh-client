@@ -47,6 +47,8 @@ struct ServerHandles {
     nums: Arc<Mutex<Vec<u64>>>,
     /// every user byte the server has received (latest full stream)
     received: Arc<Mutex<Vec<u8>>>,
+    /// every user resize the server has received (latest full stream)
+    resizes: Arc<Mutex<Vec<(i32, i32)>>>,
     saw_shutdown: Arc<AtomicBool>,
 }
 
@@ -110,6 +112,7 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
     let quit = Arc::new(AtomicBool::new(false));
     let nums = Arc::new(Mutex::new(Vec::new()));
     let received = Arc::new(Mutex::new(Vec::new()));
+    let resizes = Arc::new(Mutex::new(Vec::new()));
     let saw_shutdown = Arc::new(AtomicBool::new(false));
 
     let outbox_move = Arc::clone(&outbox);
@@ -118,6 +121,7 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
     let quit_move = Arc::clone(&quit);
     let nums_move = Arc::clone(&nums);
     let received_move = Arc::clone(&received);
+    let resizes_move = Arc::clone(&resizes);
     let shutdown_move = Arc::clone(&saw_shutdown);
     std::thread::spawn(move || {
         let mut sealer = MoshSealer::new(&key, Direction::ToClient);
@@ -185,9 +189,14 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
                                         nums_move.lock().unwrap().push(num);
                                         let mut log = received_move.lock().unwrap();
                                         log.clear();
+                                        let mut got_resizes = resizes_move.lock().unwrap();
+                                        got_resizes.clear();
                                         for event in receiver.latest_state().events() {
-                                            if let UserEvent::Byte(b) = event {
-                                                log.push(*b);
+                                            match event {
+                                                UserEvent::Byte(b) => log.push(*b),
+                                                UserEvent::Resize { width, height } => {
+                                                    got_resizes.push((*width, *height));
+                                                }
                                             }
                                         }
                                         if num == SHUTDOWN_NUM {
@@ -254,6 +263,7 @@ fn spawn_test_server(key: Base64Key) -> ServerHandles {
         quit,
         nums,
         received,
+        resizes,
         saw_shutdown,
     }
 }
@@ -837,6 +847,312 @@ fn prediction_appears_retires_and_toggles() {
         wait_until(4000, || client.prediction_overlay().is_empty()),
         "the real echo must retire the guesses"
     );
+    server.stop.store(true, Ordering::Relaxed);
+    client.terminate();
+}
+
+// --- the deferred public API ---------------------------------------------
+
+/// The deferred constructor must not spawn the UDP loop: nothing may
+/// leave the socket until [MoshSession::start] — that is the whole
+/// point of the two-phase API (the async-constructor wedge). start()
+/// must then run the normal associate → exchange → clean shutdown.
+#[test]
+fn deferred_connect_stays_silent_until_start() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+
+    let events: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let event_log = Arc::clone(&events);
+    let client = MoshSession::connect_deferred(
+        TestDisplay::new(80, 24),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        move |event| event_log.lock().unwrap().push(event),
+        80,
+        24,
+        false,
+    )
+    .expect("connect_deferred");
+
+    // no loop yet: nothing may have reached the server. A prematurely
+    // started loop would at minimum have pushed its initial resize
+    // state, so `nums` (every appended client state) is the tell —
+    // `received` alone is vacuous before any bytes are typed.
+    std::thread::sleep(Duration::from_millis(250));
+    assert!(
+        server.nums.lock().unwrap().is_empty() && server.resizes.lock().unwrap().is_empty(),
+        "the deferred session must not send before start()"
+    );
+    assert!(
+        client.link_health().never_heard,
+        "the deferred session must not hear anything before start()"
+    );
+    assert!(
+        events.lock().unwrap().is_empty(),
+        "no events may fire before start()"
+    );
+
+    // start() launches the loop from the plain synchronous context
+    client.start();
+    client.send_input(b"hi mosh\r");
+    assert!(
+        wait_until(3000, || server
+            .received
+            .lock()
+            .unwrap()
+            .ends_with(b"hi mosh\r")),
+        "after start() the input must flow"
+    );
+    client.start_shutdown();
+    assert!(
+        wait_until(5000, || events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Ended { clean: true, .. }))),
+        "the deferred session must end cleanly once started, got {:?}",
+        *events.lock().unwrap()
+    );
+    client.join();
+}
+
+/// start() is documented idempotent: the second call must be a no-op —
+/// one loop, one Ended event, a clean handshake. A duplicated loop
+/// would race the socket and the sender bookkeeping.
+#[test]
+fn start_twice_runs_one_loop() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+
+    let events: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let event_log = Arc::clone(&events);
+    let client = MoshSession::connect_deferred(
+        TestDisplay::new(80, 24),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        move |event| event_log.lock().unwrap().push(event),
+        80,
+        24,
+        false,
+    )
+    .expect("connect_deferred");
+    client.start();
+    client.start(); // must be a no-op
+
+    client.send_input(b"hi");
+    assert!(
+        wait_until(3000, || server.received.lock().unwrap().ends_with(b"hi")),
+        "input must flow exactly once through the one loop"
+    );
+    client.start_shutdown();
+    assert!(
+        wait_until(5000, || events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Ended { clean: true, .. }))),
+        "the session must end cleanly"
+    );
+    std::thread::sleep(Duration::from_millis(200));
+    let ended_count = || {
+        events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, SessionEvent::Ended { .. }))
+            .count()
+    };
+    assert_eq!(
+        ended_count(),
+        1,
+        "exactly one loop may have run, got {:?}",
+        *events.lock().unwrap()
+    );
+    // and the finished session must not be restartable: a third start()
+    // may not resurrect the loop (no new Ended may ever fire)
+    client.start();
+    std::thread::sleep(Duration::from_millis(300));
+    assert_eq!(
+        ended_count(),
+        1,
+        "start() after the session ended must be inert, got {:?}",
+        *events.lock().unwrap()
+    );
+    client.join();
+}
+
+/// The deferred twin of bring-your-own-socket: connect_on_deferred
+/// builds silently on the caller's socket, start() launches there.
+#[test]
+fn connect_on_deferred_starts_on_the_callers_socket() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+    let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind");
+
+    let client = MoshSession::connect_on_deferred(
+        TestDisplay::new(80, 24),
+        socket,
+        server.addr,
+        &key,
+        |_| {},
+        80,
+        24,
+        200, // hop interval, unused here but exercises the full signature
+        false,
+    )
+    .expect("connect_on_deferred");
+
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        server.nums.lock().unwrap().is_empty() && server.resizes.lock().unwrap().is_empty(),
+        "silent before start(): a live loop would at least push its initial resize state"
+    );
+    client.start();
+    client.send_input(b"x");
+    assert!(
+        wait_until(3000, || server.received.lock().unwrap().ends_with(b"x")),
+        "the caller's socket must carry the session once started"
+    );
+    server.stop.store(true, Ordering::Relaxed);
+    client.terminate();
+}
+
+/// resize() reflows the local display SYNCHRONOUSLY (the UI must not
+/// wait an RTT) and reaches the server as a UserStream resize event.
+#[test]
+fn client_resize_reflows_locally_and_reaches_the_server() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+    let display = TestDisplay::new(80, 24);
+    let client = MoshSession::connect(
+        Arc::clone(&display),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        |_| {},
+        80,
+        24,
+        false,
+    )
+    .expect("connect");
+    assert!(
+        wait_until(3000, || !client.link_health().never_heard),
+        "associate first"
+    );
+
+    let frames_before = client.frame_version();
+    client.resize(100, 30);
+    // local and synchronous: no waiting allowed here
+    assert!(
+        display
+            .lock()
+            .unwrap()
+            .snapshot()
+            .resizes
+            .contains(&(100, 30)),
+        "resize() must reflow the display before returning, got {:?}",
+        display.lock().unwrap().snapshot().resizes
+    );
+    assert!(
+        client.frame_version() > frames_before,
+        "the reflow must signal the embedder (frame_version stayed at {frames_before})"
+    );
+    assert!(
+        wait_until(3000, || server.resizes.lock().unwrap().contains(&(100, 30))),
+        "the resize must reach the server's user stream, got {:?}",
+        *server.resizes.lock().unwrap()
+    );
+    server.stop.store(true, Ordering::Relaxed);
+    client.terminate();
+}
+
+/// Characterization: a degenerate resize (below 2x2) must not touch
+/// the display — the in-core engine cannot render a sub-2 grid — and
+/// must not claim a reflow happened.
+#[test]
+fn degenerate_resize_leaves_the_display_alone() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+    let display = TestDisplay::new(80, 24);
+    let client = MoshSession::connect(
+        Arc::clone(&display),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        |_| {},
+        80,
+        24,
+        false,
+    )
+    .expect("connect");
+    assert!(
+        wait_until(3000, || !client.link_health().never_heard),
+        "associate first"
+    );
+
+    let frames_before = client.frame_version();
+    client.resize(1, 1);
+    assert!(
+        display.lock().unwrap().snapshot().resizes.is_empty(),
+        "a sub-2x2 resize must not reflow the display"
+    );
+    assert_eq!(
+        client.frame_version(),
+        frames_before,
+        "no reflow, no signal"
+    );
+    server.stop.store(true, Ordering::Relaxed);
+    client.terminate();
+}
+
+/// The display accessors give embedders synchronous read access, and
+/// user_stream_acked() advances through the server's newest held state
+/// as the piggybacked acknowledgments land.
+#[test]
+fn display_accessors_and_acked_introspection() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+    let client = MoshSession::connect(
+        TestDisplay::new(80, 24),
+        "127.0.0.1",
+        server.addr.port(),
+        &key,
+        |_| {},
+        80,
+        24,
+        false,
+    )
+    .expect("connect");
+    assert!(
+        wait_until(3000, || !client.link_health().never_heard),
+        "associate first"
+    );
+
+    client.send_input(b"probe");
+    assert!(
+        wait_until(3000, || server.received.lock().unwrap().ends_with(b"probe")),
+        "the input must reach the server"
+    );
+    let through = *server.nums.lock().unwrap().last().expect("a client state");
+    assert!(
+        wait_until(3000, || client.user_stream_acked() >= through),
+        "acked must advance through the server's newest state (server at {through}), got {}",
+        client.user_stream_acked()
+    );
+
+    // the two accessors must alias the SAME display: mutate through
+    // display() and read it back through with_display (a
+    // constant-vs-constant check would pass on any display)
+    client.display().lock().unwrap().resize(70, 20);
+    assert_eq!(
+        client.with_display(|d| d.cols()),
+        70,
+        "with_display must read the display() the session hands out"
+    );
+    assert_eq!(client.display().lock().unwrap().cols(), 70);
     server.stop.store(true, Ordering::Relaxed);
     client.terminate();
 }
