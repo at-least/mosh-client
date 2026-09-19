@@ -1366,3 +1366,223 @@ fn absurd_timestamp_reply_does_not_move_the_estimate() {
     server.stop.store(true, Ordering::Relaxed);
     client.terminate();
 }
+
+// --- the fatal paths ------------------------------------------------------
+
+/// A rogue peer that answers the first datagram it receives by spamming
+/// sealed fragments of a hand-built instruction — the fatal-path probe
+/// (wrong protocol version, unparsable diff, ...). Returns its bound
+/// address and a stop flag.
+fn spawn_instruction_bomb(
+    key: Base64Key,
+    inst: super::wire::TransportInstruction,
+) -> (std::net::SocketAddr, Arc<AtomicBool>) {
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_move = Arc::clone(&stop);
+    let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind");
+    let addr = socket.local_addr().expect("addr");
+    std::thread::spawn(move || {
+        let mut sealer = MoshSealer::new(&key, Direction::ToClient);
+        let mut fragmenter = Fragmenter::default();
+        let frags = fragmenter
+            .make_fragments(&inst, 1200 - 12 - 16)
+            .expect("fragments");
+        let mut peer = None;
+        let mut buf = [0u8; 2048];
+        socket
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .ok();
+        loop {
+            if stop_move.load(Ordering::Relaxed) {
+                return;
+            }
+            if let Ok((_, src)) = socket.recv_from(&mut buf) {
+                peer = Some(src);
+            }
+            if let Some(client_addr) = peer {
+                for frag in &frags {
+                    let header = PacketHeader {
+                        timestamp: 0,
+                        timestamp_reply: u16::MAX,
+                    };
+                    if let Ok(datagram) = sealer.seal(&header, &frag.tostring()) {
+                        let _ = socket.send_to(&datagram, client_addr);
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    });
+    (addr, stop)
+}
+
+/// A peer speaking a different protocol version is fatal, not silent:
+/// the session must end with Ended { clean: false } naming the version
+/// mismatch — the gate precedes everything the instruction could touch
+/// (spec §6.2; the receiver re-checks as its own invariant).
+#[test]
+fn wrong_protocol_version_kills_the_session() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let inst = super::wire::TransportInstruction {
+        protocol_version: super::wire::MOSH_PROTOCOL_VERSION + 1,
+        old_num: 0,
+        new_num: 1,
+        ..Default::default()
+    };
+    let (bomb_addr, stop) = spawn_instruction_bomb(key.clone(), inst);
+
+    let events: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let event_log = Arc::clone(&events);
+    let client = MoshSession::connect(
+        TestDisplay::new(80, 24),
+        "127.0.0.1",
+        bomb_addr.port(),
+        &key,
+        move |event| event_log.lock().unwrap().push(event),
+        80,
+        24,
+        false,
+    )
+    .expect("connect");
+
+    assert!(
+        wait_until(5000, || events.lock().unwrap().iter().any(|e| matches!(
+            e,
+            SessionEvent::Ended {
+                clean: false,
+                error: Some(err)
+            } if err.contains("protocol_version")
+        ))),
+        "the version mismatch must end the session with a naming error, got {:?}",
+        *events.lock().unwrap()
+    );
+    client.join(); // the loop must have exited, not wedged
+    stop.store(true, Ordering::Relaxed);
+}
+
+/// A well-sealed, correct-version instruction whose diff fails to
+/// parse is equally fatal: the receiver's error propagates to
+/// Ended { clean: false } (0x7F = field 15, wire type 7 — no such
+/// wire type, so HostMessage::decode cannot possibly accept it).
+#[test]
+fn unparsable_host_diff_kills_the_session() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let inst = super::wire::TransportInstruction {
+        protocol_version: super::wire::MOSH_PROTOCOL_VERSION,
+        old_num: 0,
+        new_num: 1,
+        diff: vec![0x7F],
+        ..Default::default()
+    };
+    let (bomb_addr, stop) = spawn_instruction_bomb(key.clone(), inst);
+
+    let events: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let event_log = Arc::clone(&events);
+    let client = MoshSession::connect(
+        TestDisplay::new(80, 24),
+        "127.0.0.1",
+        bomb_addr.port(),
+        &key,
+        move |event| event_log.lock().unwrap().push(event),
+        80,
+        24,
+        false,
+    )
+    .expect("connect");
+
+    assert!(
+        wait_until(5000, || events.lock().unwrap().iter().any(|e| matches!(
+            e,
+            SessionEvent::Ended {
+                clean: false,
+                error: Some(err)
+            } if err.contains("diff failed to parse")
+        ))),
+        "an unparsable diff must end the session with a naming error, got {:?}",
+        *events.lock().unwrap()
+    );
+    client.join();
+    stop.store(true, Ordering::Relaxed);
+}
+
+/// Garbage on the wire — random bytes, and datagrams validly sealed
+/// with the WRONG direction bit — is dropped, not fatal: the session
+/// keeps exchanging with its real peer and never fires Ended.
+#[test]
+fn garbage_datagrams_are_dropped_not_fatal() {
+    let key = Base64Key::parse("7l1cNvxYVkWP1j8zMC08Jg").unwrap();
+    let server = spawn_test_server(key.clone());
+
+    // bring-your-own-socket so the rogue knows where the client lives
+    let socket = UdpSocket::bind(("127.0.0.1", 0)).expect("bind");
+    let client_local = socket.local_addr().expect("addr");
+
+    let events: Arc<Mutex<Vec<SessionEvent>>> = Arc::new(Mutex::new(Vec::new()));
+    let event_log = Arc::clone(&events);
+    let client = MoshSession::connect_on(
+        TestDisplay::new(80, 24),
+        socket,
+        server.addr,
+        &key,
+        move |event| event_log.lock().unwrap().push(event),
+        80,
+        24,
+        60_000, // no roaming: the blast must keep hitting the one socket
+        false,
+    )
+    .expect("connect");
+    client.send_input(b"x");
+    assert!(
+        wait_until(3000, || !client.link_health().never_heard),
+        "associate first"
+    );
+
+    // blast hostile traffic at the client's real socket
+    let rogue = UdpSocket::bind(("127.0.0.1", 0)).expect("bind");
+    let mut wrong_direction = MoshSealer::new(&key, Direction::ToServer);
+    let mut mix: u64 = 0x243F_6A88_85A3_08D3;
+    let header = PacketHeader {
+        timestamp: 0,
+        timestamp_reply: u16::MAX,
+    };
+    for _ in 0..30 {
+        // random bytes: bad tag, bad length, whatever
+        let garbage: Vec<u8> = (0..16)
+            .map(|_| {
+                mix = mix
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (mix >> 56) as u8
+            })
+            .collect();
+        rogue.send_to(&garbage, client_local).ok();
+        // validly sealed, wrong direction: must fail the open
+        if let Ok(datagram) = wrong_direction.seal(&header, b"hostile") {
+            rogue.send_to(&datagram, client_local).ok();
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // the session is unharmed: input still reaches the real server,
+    // and nothing has ended
+    client.send_input(b"still here");
+    assert!(
+        wait_until(3000, || server
+            .received
+            .lock()
+            .unwrap()
+            .ends_with(b"still here")),
+        "input must still flow after the garbage blast"
+    );
+    assert!(
+        !events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|e| matches!(e, SessionEvent::Ended { .. })),
+        "garbage must never end the session, got {:?}",
+        *events.lock().unwrap()
+    );
+    server.stop.store(true, Ordering::Relaxed);
+    client.terminate();
+}
