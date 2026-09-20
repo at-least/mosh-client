@@ -1,7 +1,8 @@
 //! Seeds the fuzz corpora with real-shaped inputs: instructions
 //! encoded by the crate's own encoder (valid fields, valid inner
-//! diffs), single- and multi-fragment, plus edge field numbers. Run:
-//! `cargo run --manifest-path fuzz/Cargo.toml --bin gen_seeds`
+//! diffs), single- and multi-fragment, engine-produced fragments, and
+//! a full length-prefixed exchange for the sequence targets. Run:
+//! `cargo run --manifest-path fuzz/Cargo.toml --example gen_seeds`
 
 use std::fs;
 use std::path::Path;
@@ -49,9 +50,16 @@ fn sender_shaped_fragments() -> Vec<Vec<u8>> {
     let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
     let mut fragmenter = Fragmenter::default();
     let mut out = Vec::new();
-    for chunk in [b"echo golden\r".as_slice(), b"\x7f".as_slice(), b"more\x1b[A".as_slice()] {
+    for chunk in [
+        b"echo golden\r".as_slice(),
+        b"\x7f".as_slice(),
+        b"more\x1b[A".as_slice(),
+    ] {
         sender.current_state().push_bytes(chunk);
     }
+    // the mindelay clock anchors at the first divergent tick, so the
+    // send lands at back.timestamp + send_interval (t=20), not earlier
+    let _ = sender.tick(1, 120, 20, 1200, &mut fragmenter, &mut out);
     let _ = sender.tick(20, 120, 20, 1200, &mut fragmenter, &mut out);
     out.iter().map(|f| f.tostring()).collect()
 }
@@ -75,36 +83,67 @@ fn seeds() -> Vec<Vec<u8>> {
     let host_inst = inst(host_diff(), 1, 2, 2, 1);
     out.push(host_inst.encode());
 
-    // multi-fragment: a 3KB incompressible-ish diff forces slicing
-    let big: Vec<u8> = (0u32..3000)
-        .map(|i| (i.wrapping_mul(31) % 251 + 1) as u8)
+    // multi-fragment: 3KB of LCG output — genuinely incompressible,
+    // so zlib stays above the 1190-byte MTU budget and slicing is forced
+    let mut mix: u64 = 0x243F_6A88_85A3_08D3;
+    let big: Vec<u8> = (0..3000)
+        .map(|_| {
+            mix = mix
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (mix >> 56) as u8
+        })
         .collect();
-    let big_inst = inst(big.clone(), 0, 1, 0, 0);
+    let big_inst = inst(big, 0, 1, 0, 0);
     out.push(big_inst.encode());
 
-    // fragment-layer bytes for the assembly/receive corpora
+    // fragment-layer bytes for the sequence targets, wrapped as
+    // length-prefixed chunks (their input shape)
+    let mut sequence = Vec::new();
     let mut fragmenter = Fragmenter::default();
-    for i in [minimal.clone(), typical.clone(), shutdown.clone(), big_inst.clone()] {
+    for i in [
+        minimal.clone(),
+        typical.clone(),
+        shutdown.clone(),
+        big_inst.clone(),
+    ] {
         if let Ok(frags) = fragmenter.make_fragments(&i, 1200) {
             for f in frags {
-                out.push(f.tostring());
+                sequence.push(f.tostring());
             }
         }
     }
     for f in sender_shaped_fragments() {
-        out.push(f);
+        sequence.push(f);
     }
+    for bytes in &sequence {
+        out.push(prefix_chunk(bytes));
+    }
+    let mut all = Vec::new();
+    for bytes in &sequence {
+        all.extend(prefix_chunk(bytes));
+    }
+    out.push(all); // one whole exchange as a single sequence input
+    out
+}
+
+fn prefix_chunk(bytes: &[u8]) -> Vec<u8> {
+    let take = bytes.len().min(255);
+    let mut out = Vec::with_capacity(1 + take);
+    out.push(take as u8);
+    out.extend_from_slice(&bytes[..take]);
     out
 }
 
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
+    let seeds = seeds();
     for target in ["wire_decode", "fragment_assembly", "ssp_receive"] {
         let dir = root.join(target);
         fs::create_dir_all(&dir).expect("corpus dir");
-        for (i, seed) in seeds().iter().enumerate() {
+        for (i, seed) in seeds.iter().enumerate() {
             fs::write(dir.join(format!("seed-{i:02}")), seed).expect("seed write");
         }
-        println!("{target}: {} seeds", seeds().len());
+        println!("{target}: {} seeds", seeds.len());
     }
 }

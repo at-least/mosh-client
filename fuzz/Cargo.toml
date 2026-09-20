@@ -36,10 +36,3 @@ path = "fuzz_targets/ssp_receive.rs"
 test = false
 doc = false
 bench = false
-
-[[bin]]
-name = "gen_seeds"
-path = "src/bin/gen_seeds.rs"
-test = false
-doc = false
-bench = false
