@@ -1218,4 +1218,248 @@ mod tests {
         );
         assert_eq!(rx.latest().num, 3, "the queue survives untouched");
     }
+
+    /// The send schedule's exact boundaries on a manual clock:
+    /// a divergent state goes out at `back.timestamp + send_interval`
+    /// and not one tick sooner (and the state numbers advance by one);
+    /// once the un-acked backlog ages past `rto + ack-delay` the
+    /// assumed state falls back to the head and the retry timer
+    /// (`back + rto + ack-delay`) takes over; when the peer's last word
+    /// ages past ACTIVE_RETRY_TIMEOUT the scheduler stops offering
+    /// resends entirely (a dead wire is not retried).
+    #[test]
+    fn send_schedule_boundaries_are_exact() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        let mut insts = Vec::new();
+        let parse = |out: &mut Vec<Fragment>| -> TransportInstruction {
+            let mut asm = FragmentAssembly::new();
+            for f in out.drain(..) {
+                if let Some(inst) = asm.add_fragment(f) {
+                    return inst;
+                }
+            }
+            panic!("no instruction assembled");
+        };
+
+        // divergence at t=10: due at 0 + interval(20), not at 19
+        sender.current_state().push_bytes(b"a");
+        sender.tick(10, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert!(out.is_empty(), "held before the interval bound");
+        sender.tick(19, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert!(out.is_empty(), "the interval bound is exact");
+        sender.tick(20, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert_eq!(out.len(), 1, "out at back.timestamp + send_interval");
+        insts.push(parse(&mut out));
+
+        // second divergence at t=21: due at 20 + 20 = 40
+        sender.current_state().push_bytes(b"b");
+        sender.tick(39, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert!(out.is_empty(), "the second send rides the same interval");
+        sender.tick(40, 120, 20, 1200, &mut fragmenter, &mut out);
+        insts.push(parse(&mut out));
+
+        let nums: Vec<u64> = insts.iter().map(|i| i.new_num).collect();
+        assert_eq!(nums, [1, 2], "state numbers advance by exactly one");
+
+        // with current == back and the backlog fresh, the assumed state
+        // rides the newest: nothing is resent, and the retry timer
+        // (40 + rto + ack-delay = 260) is exactly what wait_time
+        // reports — the session polls on it, so it is wire contract
+        sender.tick(100, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert!(out.is_empty(), "a fresh backlog is not resent early");
+        assert_eq!(
+            sender.wait_time(100, 120, 20),
+            40 + 120 + ACK_DELAY_MS - 100,
+            "the fresh-backlog retry timer, as the session's poll sees it"
+        );
+
+        // the fallback boundary is exact: state 1 went out at 20, so at
+        // 20 + rto + ack-delay - 1 it is one ms inside the freshness
+        // window (assumed stays the newest, branch 3 not yet due at
+        // 260); at the boundary it goes stale, the assumed state falls
+        // back to the head, and the branch-2 retry (back+interval = 60,
+        // long overdue) fires at once
+        let stale_at = 20 + 120 + ACK_DELAY_MS;
+        sender.tick(stale_at - 1, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert!(out.is_empty(), "one ms inside the freshness window holds");
+        sender.tick(stale_at, 120, 20, 1200, &mut fragmenter, &mut out);
+        let retry = parse(&mut out);
+        assert_eq!(retry.new_num, 2, "the retry resends the newest state");
+        assert_eq!(retry.old_num, 0, "the diff base is the head state");
+
+        // far later, the overdue ack rides along — but it must ride as
+        // the SAME state (num 2, timestamp refreshed), not append a new
+        // one: the newest state's number is never reused-forward
+        sender.tick(5000, 120, 20, 1200, &mut fragmenter, &mut out);
+        let ride = parse(&mut out);
+        assert_eq!(
+            ride.new_num, 2,
+            "the ack ride-along refreshes the newest state in place"
+        );
+        assert_eq!(ride.old_num, 0, "its diff still bases on the head");
+    }
+
+    /// The quench gate: overflowing the received queue arms a window of
+    /// QUENCH_WINDOW_MS (overflows inside it are answered Quenched,
+    /// unsent), and the expiry boundary is exact — `now == quench_until`
+    /// flows again.
+    #[test]
+    fn quench_gate_is_exact() {
+        let mut rx = SspReceiver::new(UserStream::new(), 0);
+        let diff = crate::wire::UserMessage {
+            instructions: vec![crate::wire::UserInstruction::Keystroke(b"x".to_vec())],
+        }
+        .encode();
+        let inst = |old: u64, new: u64| TransportInstruction {
+            protocol_version: 2,
+            old_num: old,
+            new_num: new,
+            ack_num: 0,
+            throwaway_num: 0,
+            diff: diff.clone(),
+            chaff: Vec::new(),
+        };
+        // fill to exactly the cap: state 0 plus RECEIVED_QUEUE_CAP appends
+        let cap = RECEIVED_QUEUE_CAP as u64;
+        for n in 1..=cap {
+            assert!(matches!(
+                rx.process_instruction(&inst(0, n), 1000).unwrap(),
+                RecvOutcome::Latest { .. }
+            ));
+        }
+        // overflow #1 arms the window and still flows
+        assert!(matches!(
+            rx.process_instruction(&inst(1024, 1025), 1000).unwrap(),
+            RecvOutcome::Latest { .. }
+        ));
+        // overflow #2 inside the window is quenched — and stays so at
+        // the last ms of it
+        assert!(matches!(
+            rx.process_instruction(&inst(1025, 1026), 1000).unwrap(),
+            RecvOutcome::Quenched
+        ));
+        assert!(matches!(
+            rx.process_instruction(&inst(1025, 1027), 1000 + QUENCH_WINDOW_MS - 1)
+                .unwrap(),
+            RecvOutcome::Quenched
+        ));
+        // at expiry exactly, the queue flows again (and re-arms)
+        assert!(matches!(
+            rx.process_instruction(&inst(1025, 1028), 1000 + QUENCH_WINDOW_MS)
+                .unwrap(),
+            RecvOutcome::Latest { .. }
+        ));
+    }
+
+    /// The delayed ack has two shapes. A tiny backlog rides the
+    /// prospective-resend optimization: the empty diff (vs the assumed
+    /// newest state) is swapped for the full suffix based on the head —
+    /// a bet that the peer missed everything. A backlog of 1000+ bytes
+    /// stands the optimization down, and the ack goes out as a pure
+    /// empty state one past the back.
+    #[test]
+    fn empty_ack_appends_one_state() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        let parse = |out: &mut Vec<Fragment>| -> TransportInstruction {
+            let mut asm = FragmentAssembly::new();
+            for f in out.drain(..) {
+                if let Some(inst) = asm.add_fragment(f) {
+                    return inst;
+                }
+            }
+            panic!("no instruction assembled");
+        };
+
+        // A tiny backlog: the delayed ack rides the prospective-resend
+        // optimization — the empty diff (vs the assumed newest state)
+        // is swapped for the full suffix based on the head, betting the
+        // peer missed everything. No new state is appended: the resend
+        // refreshes state 1's timestamp and re-uses its number.
+        sender.current_state().push_bytes(b"a");
+        // the mindelay clock anchors at this first divergent pass
+        // (floor 19+1), but the interval bound (0+20) binds: due at 20
+        sender.tick(19, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert!(out.is_empty());
+        sender.tick(20, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert_eq!(parse(&mut out).new_num, 1);
+
+        sender.set_data_ack();
+        // the ack deadline anchors at the first timer pass after the
+        // flag (t=21) and fires 100ms later
+        sender.tick(21, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert!(out.is_empty(), "the ack is delayed, not immediate");
+        sender.tick(121, 120, 20, 1200, &mut fragmenter, &mut out);
+        let ack = parse(&mut out);
+        assert_eq!(ack.new_num, 1, "the optimized resend re-uses state 1");
+        assert_eq!(ack.old_num, 0, "its diff bases on the head");
+        assert!(!ack.diff.is_empty(), "it carries the full suffix");
+
+        // A backlog of 1000+ bytes: the optimization stands down (it
+        // only bets on suffixes under 1000 bytes), so the delayed ack
+        // goes out as a pure empty state one past the back.
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut out = Vec::new();
+        sender.current_state().push_bytes(&[b'x'; 1001]);
+        sender.tick(19, 120, 20, 1200, &mut fragmenter, &mut out);
+        sender.tick(20, 120, 20, 1200, &mut fragmenter, &mut out);
+        parse(&mut out);
+
+        sender.set_data_ack();
+        sender.tick(21, 120, 20, 1200, &mut fragmenter, &mut out);
+        sender.tick(121, 120, 20, 1200, &mut fragmenter, &mut out);
+        let ack = parse(&mut out);
+        assert_eq!(
+            ack.new_num, 2,
+            "the pure empty ack appends exactly one state"
+        );
+        assert!(ack.diff.is_empty(), "it carries no diff");
+        assert_eq!(ack.old_num, 1, "its base is the assumed state");
+    }
+
+    /// The shutdown-retry timeout boundary: a full
+    /// ACTIVE_RETRY_TIMEOUT since shutdown started, to the ms.
+    #[test]
+    fn shutdown_ack_timeout_boundary_is_exact() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        sender.start_shutdown(1000);
+        assert!(
+            !sender.shutdown_ack_timed_out(1000 + ACTIVE_RETRY_TIMEOUT_MS - 1),
+            "one ms short of the timeout is not timed out"
+        );
+        assert!(
+            sender.shutdown_ack_timed_out(1000 + ACTIVE_RETRY_TIMEOUT_MS),
+            "the full timeout, to the ms, is timed out"
+        );
+    }
+
+    /// The introspection accessors say what the bookkeeping did: the
+    /// acked timestamp names the oldest held state, and the event log's
+    /// size is honest.
+    #[test]
+    fn accessor_basics_are_honest() {
+        let mut stream = UserStream::new();
+        assert!(stream.is_empty());
+        stream.push_bytes(b"abc");
+        assert_eq!(stream.events().len(), 3);
+        assert!(!stream.is_empty());
+
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        sender.current_state().push_bytes(b"a");
+        sender.tick(19, 120, 20, 1200, &mut fragmenter, &mut out);
+        sender.tick(20, 120, 20, 1200, &mut fragmenter, &mut out);
+        // two states held (0 and 1): the oldest is the t=0 reference
+        assert_eq!(sender.sent_state_acked_timestamp(), 0);
+        sender.process_acknowledgment_through(1);
+        assert_eq!(
+            sender.sent_state_acked_timestamp(),
+            20,
+            "after the ack, the oldest held state is the one sent at 20"
+        );
+    }
 }
