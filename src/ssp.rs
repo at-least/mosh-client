@@ -1462,4 +1462,375 @@ mod tests {
             "after the ack, the oldest held state is the one sent at 20"
         );
     }
+
+    /// send_interval = ceil(srtt/2) clamped to [20, 250] — two frames
+    /// per RTT, bounded (spec §6.1). The clamp points exactly.
+    #[test]
+    fn send_interval_ms_is_half_srtt_clamped() {
+        assert_eq!(send_interval_ms(0.0), 20);
+        assert_eq!(send_interval_ms(40.0), 20);
+        assert_eq!(send_interval_ms(81.0), 41, "an odd srtt rounds UP");
+        assert_eq!(send_interval_ms(100.0), 50);
+        assert_eq!(send_interval_ms(1000.0), 250);
+        assert_eq!(send_interval_ms(5000.0), 250);
+    }
+
+    /// EventLog bookkeeping: len/emptiness are honest, iter() is in
+    /// replay order, and suffix_over returns the exact suffix — the
+    /// extension, the equal-log (Some(empty), not None), the diverged
+    /// trunk, and the longer base each have one answer. The empty-base
+    /// over empty-log case is the (None, None) trunk arm.
+    #[test]
+    fn event_log_suffix_and_order_are_exact() {
+        let ev = |b: u8| HostEvent::Bytes(vec![b]);
+        let mut a = EventLog::new();
+        assert!(a.is_empty());
+        assert_eq!(a.len(), 0);
+        for b in b'1'..=b'3' {
+            a.push(ev(b));
+        }
+        assert_eq!(a.len(), 3);
+        assert!(!a.is_empty());
+        assert_eq!(
+            a.iter()
+                .iter()
+                .map(|e| match e {
+                    HostEvent::Bytes(v) => v[0],
+                    _ => 0,
+                })
+                .collect::<Vec<_>>(),
+            b"123",
+            "iter() is replay order"
+        );
+
+        // extension: b = a + e4 + e5 → the exact two events, in order
+        let mut b = a.clone();
+        b.push(ev(b'4'));
+        b.push(ev(b'5'));
+        let suffix = b.suffix_over(&a).expect("an extension carries a suffix");
+        assert_eq!(
+            suffix
+                .iter()
+                .map(|e| match e {
+                    HostEvent::Bytes(v) => v[0],
+                    _ => 0,
+                })
+                .collect::<Vec<_>>(),
+            b"45",
+            "the suffix is the extension's events, in replay order"
+        );
+
+        // equal logs: the empty suffix IS a suffix (None means diverged)
+        assert_eq!(
+            a.suffix_over(&a.clone()).map(|v| v.len()),
+            Some(0),
+            "an identical log carries an EMPTY suffix, not a divergence"
+        );
+        // diverged at equal depth: no suffix, rebuild required
+        let mut c = a.clone();
+        c.push(ev(b'4'));
+        let mut d = a.clone();
+        d.push(ev(b'9'));
+        assert!(
+            c.suffix_over(&d).is_none(),
+            "diverged trunks have no suffix"
+        );
+        // a longer base is never a suffix of a shorter log
+        assert!(a.suffix_over(&b).is_none());
+        // the empty/empty trunk
+        assert_eq!(
+            EventLog::new()
+                .suffix_over(&EventLog::new())
+                .map(|v| v.len()),
+            Some(0)
+        );
+    }
+
+    /// Ack semantics: an ack naming a state we never held (a future
+    /// number) is ignored wholesale — the queue survives untouched and
+    /// the session keeps working. And after an ack shrinks the queue,
+    /// the assumed index must stay IN BOUNDS for the next timer read.
+    #[test]
+    fn unknown_acks_are_ignored_and_assumed_stays_in_bounds() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        for i in 0..3u8 {
+            sender.current_state().push_bytes(&[b'a' + i]);
+            sender.tick(20 * i as u64 + 1, 120, 20, 1200, &mut fragmenter, &mut out);
+            sender.tick(
+                20 * (i as u64 + 1),
+                120,
+                20,
+                1200,
+                &mut fragmenter,
+                &mut out,
+            );
+        }
+        out.clear();
+
+        // the ack drops states 0..1; the assumed index (pointing at the
+        // newest, index 3) must clamp to the new length
+        sender.process_acknowledgment_through(1);
+        assert_eq!(
+            sender.sent_state_acked_timestamp(),
+            20,
+            "front is now the state sent at 20"
+        );
+        // with the clamped index the assumed state IS the newest
+        // (== current): the full-suffix retry timer answers, and the
+        // index stays in bounds for the read
+        assert_eq!(sender.wait_time(61, 120, 20), 60 + 120 + ACK_DELAY_MS - 61);
+
+        // an ack for a state that was never sent: ignored, nothing moves
+        sender.process_acknowledgment_through(99);
+        assert_eq!(
+            sender.sent_state_acked_timestamp(),
+            20,
+            "an unknown ack must not touch the queue"
+        );
+        assert_eq!(sender.wait_time(61, 120, 20), 60 + 120 + ACK_DELAY_MS - 61);
+    }
+
+    /// Past SENT_QUEUE_CAP the middle of the queue is culled (mosh's
+    /// erase(end()-16)): the head and the newest 16 survive. An ack
+    /// naming a culled state is IGNORED (idempotency), one naming a
+    /// survivor is processed.
+    #[test]
+    fn cull_drops_the_middle_and_its_ack_is_ignored() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        for i in 0..33u8 {
+            sender.current_state().push_bytes(&[b'a' + i % 26]);
+            sender.tick(3 * i as u64 + 1, 120, 3, 1200, &mut fragmenter, &mut out);
+            sender.tick(3 * (i as u64 + 1), 120, 3, 1200, &mut fragmenter, &mut out);
+        }
+        out.clear();
+
+        // states 17 and 18 were culled from the middle; state 0 (t=0)
+        // is still the front
+        assert_eq!(sender.sent_state_acked_timestamp(), 0);
+        sender.process_acknowledgment_through(17);
+        assert_eq!(
+            sender.sent_state_acked_timestamp(),
+            0,
+            "an ack naming a culled state is ignored"
+        );
+        sender.process_acknowledgment_through(19);
+        assert_eq!(
+            sender.sent_state_acked_timestamp(),
+            3 * 19,
+            "an ack naming a survivor drops the head (state 19 sent at t=57)"
+        );
+    }
+
+    /// The empty-ack path has no post-send index fixup, so the cull's
+    /// assumed-index adjustment is load-bearing there: the ack appends
+    /// state 33 and culls back to 32, and the adjusted index must stay
+    /// in bounds for the next timer read. To actually reach the path,
+    /// the pending full suffix must be ≥100 bytes — otherwise the
+    /// prospective-resend optimization swaps the empty diff for the
+    /// small suffix and the send rides the timestamp-refresh branch
+    /// (no append, no cull). Four-byte chunks put the suffix at 137.
+    ///
+    /// The two comparison operators in the fixup itself are equivalent
+    /// under every reachable configuration: the freshness walk returns
+    /// only 0 or len-1 (timestamps are monotonic, so only index 1 can
+    /// be the first stale state), and after an empty ack the two
+    /// newest states both equal `current`, so len-2 vs len-1 select
+    /// the same timer.
+    #[test]
+    fn empty_ack_cull_keeps_assumed_coherent() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        // 32 states at a 3ms cadence — everything stays inside the
+        // rto + ack-delay freshness window (220ms), so the assumed
+        // state rides the newest
+        for i in 0..32u8 {
+            let chunk = [b'a' + i % 26; 4];
+            sender.current_state().push_bytes(&chunk);
+            sender.tick(3 * i as u64 + 1, 120, 3, 1200, &mut fragmenter, &mut out);
+            sender.tick(3 * (i as u64 + 1), 120, 3, 1200, &mut fragmenter, &mut out);
+        }
+        out.clear();
+
+        sender.set_data_ack();
+        sender.tick(97, 120, 3, 1200, &mut fragmenter, &mut out); // anchors 197
+        assert!(out.is_empty(), "the ack is delayed");
+        sender.tick(197, 120, 3, 1200, &mut fragmenter, &mut out); // fires + culls
+        assert!(!out.is_empty(), "the empty ack went out");
+
+        // the adjusted index (30) names num 32, which still equals
+        // current — the full-suffix retry timer answers, and the index
+        // stays IN BOUNDS (an unadjusted or wrong adjustment reads past
+        // the 32-state queue)
+        assert_eq!(
+            sender.wait_time(198, 120, 3),
+            197 + 120 + ACK_DELAY_MS - 198,
+            "the cull must keep the assumed index coherent for the timer read"
+        );
+    }
+
+    /// The optimization swaps on EQUAL full-suffix sizes: a ≥1000-byte
+    /// divergence computed against a newest state identical to the head
+    /// (an empty-ack duplicate) — equal length still bets on the head.
+    #[test]
+    fn optimization_swaps_on_equal_full_suffixes() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        let parse = |out: &mut Vec<Fragment>| -> TransportInstruction {
+            let mut asm = FragmentAssembly::new();
+            for f in out.drain(..) {
+                if let Some(inst) = asm.add_fragment(f) {
+                    return inst;
+                }
+            }
+            panic!("no instruction assembled");
+        };
+
+        // an empty-ack duplicate of the empty head (state 1)
+        sender.set_data_ack();
+        sender.tick(1, 120, 20, 1200, &mut fragmenter, &mut out);
+        sender.tick(101, 120, 20, 1200, &mut fragmenter, &mut out);
+        parse(&mut out);
+
+        // a 1001-byte divergence: proposed (vs newest, empty) and
+        // resend (vs head, empty) are BOTH 1010 bytes — equal still
+        // swaps to the head base
+        sender.current_state().push_bytes(&[b'x'; 1001]);
+        sender.tick(102, 120, 20, 1200, &mut fragmenter, &mut out);
+        sender.tick(121, 120, 20, 1200, &mut fragmenter, &mut out);
+        let inst = parse(&mut out);
+        assert_eq!(inst.old_num, 0, "equal sizes swap to the head base");
+        assert_eq!(inst.diff.len(), 1010, "the full suffix rides");
+    }
+
+    /// The optimization holds at the exact 100-byte boundary: when the
+    /// resend wins by exactly 100 bytes (and stays under 1000), the
+    /// bet is NOT taken — the diff against the newest goes out.
+    /// Sizes: newest = 97 bytes; +31 more → resend = enc(128) = 137,
+    /// proposed = enc(31) = 37, difference exactly 100.
+    #[test]
+    fn optimization_holds_at_the_100_byte_boundary() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        let parse = |out: &mut Vec<Fragment>| -> TransportInstruction {
+            let mut asm = FragmentAssembly::new();
+            for f in out.drain(..) {
+                if let Some(inst) = asm.add_fragment(f) {
+                    return inst;
+                }
+            }
+            panic!("no instruction assembled");
+        };
+
+        sender.current_state().push_bytes(&[b'y'; 97]);
+        sender.tick(1, 120, 20, 1200, &mut fragmenter, &mut out);
+        sender.tick(20, 120, 20, 1200, &mut fragmenter, &mut out);
+        parse(&mut out);
+
+        sender.current_state().push_bytes(&[b'z'; 31]);
+        sender.tick(21, 120, 20, 1200, &mut fragmenter, &mut out);
+        sender.tick(40, 120, 20, 1200, &mut fragmenter, &mut out);
+        let inst = parse(&mut out);
+        assert_eq!(inst.old_num, 1, "a 100-byte win is not worth the resend");
+        assert_eq!(inst.diff.len(), 37, "the 31-byte suffix goes out");
+    }
+
+    /// The second condition compares the byte DIFFERENCE, not the
+    /// ratio: a 401-byte gap (resend 503 vs proposed 102, both under
+    /// the 1000 ceiling) holds — a ratio test (503/102 ≈ 5) would call
+    /// this a tiny win and wrongly resend.
+    #[test]
+    fn optimization_holds_when_the_resend_wins_by_400() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        let parse = |out: &mut Vec<Fragment>| -> TransportInstruction {
+            let mut asm = FragmentAssembly::new();
+            for f in out.drain(..) {
+                if let Some(inst) = asm.add_fragment(f) {
+                    return inst;
+                }
+            }
+            panic!("no instruction assembled");
+        };
+
+        sender.current_state().push_bytes(&[b'y'; 398]);
+        sender.tick(1, 120, 20, 1200, &mut fragmenter, &mut out);
+        sender.tick(20, 120, 20, 1200, &mut fragmenter, &mut out);
+        parse(&mut out);
+
+        sender.current_state().push_bytes(&[b'z'; 96]);
+        sender.tick(21, 120, 20, 1200, &mut fragmenter, &mut out);
+        sender.tick(40, 120, 20, 1200, &mut fragmenter, &mut out);
+        let inst = parse(&mut out);
+        assert_eq!(inst.old_num, 1, "a 400-byte gap is not a small win");
+        assert_eq!(inst.diff.len(), 102);
+    }
+
+    /// The shutdown retry counter, not just the wall clock, bounds the
+    /// give-up: 16 shutdown sends (well inside ACTIVE_RETRY_TIMEOUT)
+    /// must time out, while one send after a long healthy exchange
+    /// must not.
+    #[test]
+    fn shutdown_retry_counter_bounds_the_timeout() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        for i in 0..20u8 {
+            sender.current_state().push_bytes(&[b'a' + i % 26]);
+            sender.tick(20 * i as u64 + 1, 120, 20, 1200, &mut fragmenter, &mut out);
+            sender.tick(
+                20 * (i as u64 + 1),
+                120,
+                20,
+                1200,
+                &mut fragmenter,
+                &mut out,
+            );
+        }
+        out.clear();
+
+        sender.start_shutdown(401);
+        // one shutdown send: nowhere near the retry ceiling or the
+        // wall-clock timeout
+        sender.tick(420, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert!(!out.is_empty(), "the shutdown state goes out");
+        assert!(
+            !sender.shutdown_ack_timed_out(430),
+            "one try after a healthy exchange must not time out"
+        );
+
+        // drive the retry cadence (every interval) to the ceiling well
+        // inside ACTIVE_RETRY_TIMEOUT
+        for t in (440..=720u64).step_by(20) {
+            sender.tick(t, 120, 20, 1200, &mut fragmenter, &mut out);
+        }
+        assert!(
+            sender.shutdown_ack_timed_out(721),
+            "SHUTDOWN_RETRIES shutdown sends must time out (721-401 = 320ms << ART)"
+        );
+    }
+
+    /// set_current_state replaces the working state wholesale (the
+    /// embedder's escape hatch from current_state() borrowing).
+    #[test]
+    fn set_current_state_replaces_the_working_state() {
+        let mut sender: SspSender<UserStream> = SspSender::new(UserStream::new(), 0, 1);
+        let mut fresh = UserStream::new();
+        fresh.push_bytes(b"xyz");
+        sender.set_current_state(fresh);
+        assert_eq!(sender.current_state().events().len(), 3);
+
+        let mut fragmenter = Fragmenter::default();
+        let mut out = Vec::new();
+        sender.tick(1, 120, 20, 1200, &mut fragmenter, &mut out);
+        sender.tick(20, 120, 20, 1200, &mut fragmenter, &mut out);
+        assert!(!out.is_empty(), "the replaced state must send");
+    }
 }
