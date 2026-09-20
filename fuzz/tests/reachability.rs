@@ -51,20 +51,14 @@ fn seeds_reach_assembly_reassembly_and_both_receivers() {
 /// decoder (or the wire_decode target starts from nothing).
 #[test]
 fn wire_seeds_decode() {
-    use mosh_client::{HostMessage, TransportInstruction, UserMessage};
     let mut user = 0;
     let mut host = 0;
     let mut transport = 0;
     for seed in mosh_client_fuzz::wire_seeds() {
-        if UserMessage::decode(&seed).is_ok() {
-            user += 1;
-        }
-        if HostMessage::decode(&seed).is_ok() {
-            host += 1;
-        }
-        if TransportInstruction::decode(&seed).is_ok() {
-            transport += 1;
-        }
+        let counts = mosh_client_fuzz::drive_wire_decode(&seed);
+        user += counts.user;
+        host += counts.host;
+        transport += counts.transport;
     }
     assert!(user > 0, "at least one UserMessage seed must decode");
     assert!(host > 0, "at least one HostMessage seed must decode");

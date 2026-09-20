@@ -87,6 +87,29 @@ fn parse_chunks(data: &[u8]) -> impl Iterator<Item = Fragment> + '_ {
     })
 }
 
+/// The `wire_decode` harness body: the three schema decoders on raw
+/// bytes. Total on hostile input is the wire layer's contract (§5).
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct WireDecodeCounts {
+    pub user: u32,
+    pub host: u32,
+    pub transport: u32,
+}
+
+pub fn drive_wire_decode(data: &[u8]) -> WireDecodeCounts {
+    let mut counts = WireDecodeCounts::default();
+    if mosh_client::UserMessage::decode(data).is_ok() {
+        counts.user += 1;
+    }
+    if mosh_client::HostMessage::decode(data).is_ok() {
+        counts.host += 1;
+    }
+    if mosh_client::TransportInstruction::decode(data).is_ok() {
+        counts.transport += 1;
+    }
+    counts
+}
+
 // --- the seed shapes ------------------------------------------------------
 
 fn user_diff(bytes: &[u8]) -> Vec<u8> {
