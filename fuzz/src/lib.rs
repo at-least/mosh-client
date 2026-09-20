@@ -1,11 +1,93 @@
-//! Seed shapes shared by the generator example and the reachability
-//! test: instructions encoded by the crate's own encoder, wrapped in
-//! the sequence targets' 2-byte-LE length-prefixed chunk format.
+//! The fuzz harness bodies, shared with the reachability test so the
+//! input format can never drift between what is fuzzed and what is
+//! checked, plus the seed shapes the generator writes.
 
+use mosh_client::ssp::HostStreamState;
 use mosh_client::{
-    Fragmenter, HostInstruction, HostMessage, SspSender, TransportInstruction, UserInstruction,
-    UserMessage, UserStream, MOSH_PROTOCOL_VERSION, SHUTDOWN_NUM,
+    Fragment, FragmentAssembly, Fragmenter, HostInstruction, HostMessage, RecvOutcome, SspReceiver,
+    SspSender, TransportInstruction, UserInstruction, UserMessage, UserStream,
+    MOSH_PROTOCOL_VERSION, SHUTDOWN_NUM,
 };
+
+// --- the shared harness bodies -------------------------------------------
+
+/// What one `ssp_receive` input drove: fragments parsed, instructions
+/// assembled (multi = completed by a fragment_num ≥ 1 fragment — the
+/// actual reassembly property, not a fed-fragment proxy), and Latest
+/// outcomes on each receiver.
+#[derive(Default, Debug, PartialEq, Eq)]
+pub struct SspReceiveCounts {
+    pub parsed_fragments: u32,
+    pub assembled: u32,
+    pub multi_fragment_completions: u32,
+    pub user_latest: u32,
+    pub host_latest: u32,
+}
+
+pub fn drive_ssp_receive(data: &[u8]) -> SspReceiveCounts {
+    let mut counts = SspReceiveCounts::default();
+    let mut assembly = FragmentAssembly::new();
+    let mut user_rx = SspReceiver::new(UserStream::new(), 0);
+    let mut host_rx = SspReceiver::new(HostStreamState::new(), 0);
+    for fragment in parse_chunks(data) {
+        counts.parsed_fragments += 1;
+        let completing = fragment.fragment_num >= 1;
+        if let Some(inst) = assembly.add_fragment(fragment) {
+            counts.assembled += 1;
+            if completing {
+                counts.multi_fragment_completions += 1;
+            }
+            if let Ok(RecvOutcome::Latest { .. }) = user_rx.process_instruction(&inst, 0) {
+                counts.user_latest += 1;
+            }
+            if let Ok(RecvOutcome::Latest { .. }) = host_rx.process_instruction(&inst, 0) {
+                counts.host_latest += 1;
+            }
+        }
+    }
+    counts
+}
+
+/// The `fragment_assembly` harness body: parse + assembly only.
+pub fn drive_fragment_assembly(data: &[u8]) -> (u32, u32, u32) {
+    let (mut parsed, mut assembled, mut multi) = (0, 0, 0);
+    let mut assembly = FragmentAssembly::new();
+    for fragment in parse_chunks(data) {
+        parsed += 1;
+        let completing = fragment.fragment_num >= 1;
+        if assembly.add_fragment(fragment).is_some() {
+            assembled += 1;
+            if completing {
+                multi += 1;
+            }
+        }
+    }
+    (parsed, assembled, multi)
+}
+
+/// The sequence targets' input shape: 2-byte little-endian length-
+/// prefixed fragments. u16 (not u8) so a full MTU-sized fragment fits
+/// in one chunk — that is the whole point.
+fn parse_chunks(data: &[u8]) -> impl Iterator<Item = Fragment> + '_ {
+    let mut pos = 0;
+    std::iter::from_fn(move || {
+        while pos + 2 <= data.len() {
+            let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+            pos += 2;
+            if pos + len > data.len() {
+                return None;
+            }
+            let bytes = &data[pos..pos + len];
+            pos += len;
+            if let Ok(fragment) = Fragment::parse(bytes) {
+                return Some(fragment);
+            }
+        }
+        None
+    })
+}
+
+// --- the seed shapes ------------------------------------------------------
 
 fn user_diff(bytes: &[u8]) -> Vec<u8> {
     UserMessage {
@@ -59,9 +141,6 @@ fn sender_shaped_fragments() -> Vec<Vec<u8>> {
     out.iter().map(|f| f.tostring()).collect()
 }
 
-/// The chunk wrapper of the sequence targets: a u16 little-endian
-/// length, then the bytes. u16 (not u8) so a full MTU-sized fragment
-/// fits — that is the whole point.
 pub fn prefix_chunk(bytes: &[u8]) -> Vec<u8> {
     let take = bytes.len().min(u16::MAX as usize);
     let mut out = Vec::with_capacity(2 + take);
@@ -70,27 +149,24 @@ pub fn prefix_chunk(bytes: &[u8]) -> Vec<u8> {
     out
 }
 
-pub fn seeds() -> Vec<Vec<u8>> {
-    let mut out: Vec<Vec<u8>> = Vec::new();
+/// Raw schema bytes for the `wire_decode` corpus.
+pub fn wire_seeds() -> Vec<Vec<u8>> {
+    vec![
+        UserMessage::default().encode(),
+        user_diff(b"hi mosh\r"),
+        HostMessage::default().encode(),
+        host_diff(),
+        inst(Vec::new(), 0, 0, 0, 0).encode(),
+        inst(user_diff(b"echo golden\r"), 0, 1, 1, 0).encode(),
+        inst(Vec::new(), 3, SHUTDOWN_NUM, 4, 1).encode(),
+        inst(host_diff(), 0, 1, 0, 0).encode(),
+    ]
+}
 
-    // raw schema bytes for the wire_decode corpus
-    out.push(UserMessage::default().encode());
-    out.push(user_diff(b"hi mosh\r"));
-    out.push(HostMessage::default().encode());
-    out.push(host_diff());
-
-    // instructions: minimal, typical, shutdown, hostile-looking edges
-    let minimal = inst(Vec::new(), 0, 0, 0, 0);
-    out.push(minimal.encode());
-    let typical = inst(user_diff(b"echo golden\r"), 0, 1, 1, 0);
-    out.push(typical.encode());
-    let shutdown = inst(Vec::new(), 3, SHUTDOWN_NUM, 4, 1);
-    out.push(shutdown.encode());
-    let host_inst = inst(host_diff(), 0, 1, 0, 0);
-    out.push(host_inst.encode());
-
-    // multi-fragment: 3KB of LCG output — genuinely incompressible,
-    // so zlib stays above the 1190-byte MTU budget and slicing is forced
+/// Chunked fragment sequences for the assembly/receive corpora. The
+/// big diff is 3KB of LCG output — genuinely incompressible, so zlib
+/// stays above the 1190-byte MTU budget and slicing is forced.
+pub fn sequence_seeds() -> Vec<Vec<u8>> {
     let mut mix: u64 = 0x243F_6A88_85A3_08D3;
     let big: Vec<u8> = (0..3000)
         .map(|_| {
@@ -101,12 +177,16 @@ pub fn seeds() -> Vec<Vec<u8>> {
         })
         .collect();
     let big_inst = inst(big, 0, 1, 0, 0);
-    out.push(big_inst.encode());
 
-    // fragment-layer bytes for the sequence targets, wrapped as chunks
     let mut sequence = Vec::new();
     let mut fragmenter = Fragmenter::default();
-    for i in [minimal, typical, shutdown, big_inst] {
+    for i in [
+        inst(Vec::new(), 0, 0, 0, 0),
+        inst(user_diff(b"echo golden\r"), 0, 1, 1, 0),
+        inst(Vec::new(), 3, SHUTDOWN_NUM, 4, 1),
+        inst(host_diff(), 0, 1, 0, 0),
+        big_inst,
+    ] {
         if let Ok(frags) = fragmenter.make_fragments(&i, 1200) {
             for f in frags {
                 sequence.push(f.tostring());
@@ -116,9 +196,8 @@ pub fn seeds() -> Vec<Vec<u8>> {
     for f in sender_shaped_fragments() {
         sequence.push(f);
     }
-    for bytes in &sequence {
-        out.push(prefix_chunk(bytes));
-    }
+
+    let mut out: Vec<Vec<u8>> = sequence.iter().map(|b| prefix_chunk(b)).collect();
     let mut all = Vec::new();
     for bytes in &sequence {
         all.extend(prefix_chunk(bytes));

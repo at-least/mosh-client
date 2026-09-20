@@ -6,8 +6,12 @@ use std::path::Path;
 
 fn main() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("corpus");
-    let seeds = mosh_client_fuzz::seeds();
-    for target in ["wire_decode", "fragment_assembly", "ssp_receive"] {
+    let jobs: [(&str, Vec<Vec<u8>>); 3] = [
+        ("wire_decode", mosh_client_fuzz::wire_seeds()),
+        ("fragment_assembly", mosh_client_fuzz::sequence_seeds()),
+        ("ssp_receive", mosh_client_fuzz::sequence_seeds()),
+    ];
+    for (target, seeds) in jobs {
         let dir = root.join(target);
         fs::create_dir_all(&dir).expect("corpus dir");
         for (i, seed) in seeds.iter().enumerate() {

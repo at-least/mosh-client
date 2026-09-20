@@ -29,4 +29,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --locked
       - run: cargo test --locked
+      # the fuzz crate's harness drivers + seed reachability pin run on
+      # stable too (the libfuzzer targets themselves are nightly-only)
+      - run: cargo test --locked --manifest-path fuzz/Cargo.toml --tests
       - run: cargo clippy --all-targets --locked -- -D warnings
