@@ -1,8 +1,9 @@
 //! The post-decrypt datagram bodies, as SEQUENCES: the input is
-//! length-prefixed chunks ([len u8][bytes]...) fed to ONE persistent
-//! assembly — so multi-fragment reassembly, duplicate and conflicting
+//! 2-byte-LE length-prefixed chunks fed to ONE persistent assembly —
+//! so multi-fragment reassembly, duplicate and conflicting
 //! retransmissions, id bumps, and hole resets (spec §4) are all
-//! reachable, not just the single-fragment happy path.
+//! reachable, not just the single-fragment happy path. The u16 prefix
+//! matters: an MTU-sized fragment must fit in one chunk.
 
 #![no_main]
 
@@ -12,9 +13,9 @@ use mosh_client::{Fragment, FragmentAssembly};
 fuzz_target!(|data: &[u8]| {
     let mut assembly = FragmentAssembly::new();
     let mut pos = 0;
-    while pos < data.len() {
-        let len = data[pos] as usize;
-        pos += 1;
+    while pos + 2 <= data.len() {
+        let len = u16::from_le_bytes([data[pos], data[pos + 1]]) as usize;
+        pos += 2;
         if pos + len > data.len() {
             break;
         }
