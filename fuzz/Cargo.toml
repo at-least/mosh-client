@@ -1,0 +1,45 @@
+[package]
+name = "mosh-client-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.mosh-client]
+path = ".."
+
+# Fuzz the DECRYPTED plaintext: the crypto tag stops arbitrary bytes
+# cold, so the hostile surface starts at the fragment/instruction layer
+# (spec §4-§6). These run on nightly via `cargo +nightly fuzz run`.
+[[bin]]
+name = "wire_decode"
+path = "fuzz_targets/wire_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fragment_assembly"
+path = "fuzz_targets/fragment_assembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ssp_receive"
+path = "fuzz_targets/ssp_receive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gen_seeds"
+path = "src/bin/gen_seeds.rs"
+test = false
+doc = false
+bench = false
