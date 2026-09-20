@@ -53,4 +53,5 @@ jobs:
           workspaces: |
             . -> target
             fuzz -> fuzz/target
+      - run: cargo install cargo-fuzz --locked
       - run: cargo +nightly fuzz build
