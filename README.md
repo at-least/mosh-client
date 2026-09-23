@@ -1,5 +1,5 @@
 > **FROZEN 2026-09-24** — this crate now lives in the conch monorepo
-> (`shared/mosh-client`, full history preserved via git subtree). This
+> (`shared/mosh_client` — underscores since the 2026-09-24 rename, full history preserved via git subtree). This
 > standalone repo is archived; no further work happens here.
 
 # mosh-client
